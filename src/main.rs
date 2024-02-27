@@ -1,24 +1,27 @@
 use std::{
     f32::consts::PI,
-    ops::{Add, Sub},
-    sync::{Arc, Barrier, Mutex, RwLock},
-    thread::spawn,
+    ops::{Add, Sub}, thread::sleep, time::Duration,
+};
+
+use ncurses::{
+    addch, attroff, attrset, clear, endwin, getch, getmaxx, getmaxy, init_pair, initscr, refresh, start_color, stdscr, COLOR_BLACK, COLOR_BLUE, COLOR_GREEN, COLOR_PAIR, COLOR_RED
 };
 
 const STEP_SIZE: f32 = 0.1;
 const X_INIT_POS: f32 = 10.0;
 const SUMO_SIZE: f32 = 2.5;
-const BOUND_SIZE: f32 = 0.5;
+const COLLISION_BOUNDRY_SIZE: f32 = 0.5;
+const DRAWING_BOUNDRY_SIZE: f32 = 0.5;
 const ORIGIN: SumoState = SumoState {
     x: 0.0,
     y: 0.0,
     dir: 0.0,
 };
 const TATAMI_SIZE: f32 = 20.0;
-const PUSH_FRICTION: f32 = 10.0;
+const PUSH_FRICTION: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug)]
-struct SumoState {
+pub struct SumoState {
     x: f32,
     y: f32,
     dir: f32,
@@ -68,7 +71,7 @@ impl Add<SumoState> for SumoState {
         SumoState {
             x: self.x + sstate.x,
             y: self.y + sstate.y,
-            dir: (self.dir + sstate.dir) % 2.0*PI,
+            dir: (self.dir + sstate.dir) % (2.0 * PI),
         }
     }
 }
@@ -83,64 +86,41 @@ impl Sub<SumoState> for SumoState {
     }
 }
 
+fn is_near<T>(x: T, y: T, bound: T) -> bool
+where
+    T: Add<Output = T>,
+    T: Sub<Output = T>,
+    T: PartialOrd,
+    T: Copy,
+{
+    x < y + bound && x > y - bound
+}
+
 type Strategy = fn(f32) -> (f32, f32);
-pub fn create_strat_prober(strat1: Strategy, strat2: Strategy) -> std::thread::JoinHandle<()> {
-    let mut sym_state = Ok((
+pub fn probe_strategy(strat1: Strategy, strat2: Strategy) -> Vec<[SumoState; 2]> {
+    let mut sym_state = [
         SumoState {
             x: X_INIT_POS,
             y: 0.0,
-            dir: 0.0,
+            dir: PI
         },
         SumoState {
             x: -X_INIT_POS,
             y: 0.0,
-            dir: PI,
+            dir: 0.0,
         },
-    ));
-    let sym_lock = Arc::new(RwLock::new(Ok((0.0, 0.0))));
-    let (s1_lock, s2_lock) = (sym_lock.clone(), sym_lock.clone());
+    ];
 
-    let s1_moves = Arc::new(Mutex::new((to_req((0.0, 0.0)), to_req((0.0, 0.0)))));
-    let s2_moves = s1_moves.clone();
-    let ss_reads = s1_moves.clone();
-
-    fn to_req((motor_l, motor_r): (f32, f32)) -> SumoReq {
+    fn as_req((motor_l, motor_r): (f32, f32)) -> SumoReq {
         SumoReq { motor_l, motor_r }
     }
 
-    let barrier1 = Arc::new(Barrier::new(2));
-    let barrier2 = barrier1.clone();
-
-    spawn(move || loop {
-        {
-            let ir_read = s1_lock.read().unwrap();
-            let mut s1_tx = s1_moves.lock().unwrap();
-            if ir_read.is_err() {
-                break;
-            }
-            s1_tx.0 = to_req(dbg!(strat1(ir_read.unwrap().0)));
-        }
-        barrier1.wait();
-    });
-
-    spawn(move || loop {
-        {
-            let ir_read = s2_lock.read().unwrap();
-            let mut s2_tx = s2_moves.lock().unwrap();
-            if ir_read.is_err() {
-                break;
-            }
-            s2_tx.1 = to_req(dbg!(strat2(ir_read.unwrap().1)));
-        }
-        barrier2.wait();
-    });
-
     fn update(
-        mut sy_s @ (mut sysl, mut sysr): (SumoState, SumoState),
-        (reql, reqr): (SumoReq, SumoReq),
-    ) -> Result<(SumoState, SumoState), Robocillo> {
-        sy_s = (sysl + reql.into(), sysr + reqr.into());
-        if sysl.dist(sysr) < 2.0 * SUMO_SIZE + BOUND_SIZE {
+        [sysl, sysr]: [SumoState; 2],
+        [reql, reqr]: [SumoReq; 2],
+    ) -> Result<[SumoState; 2], Robocillo> {
+        let mut sy_s = [sysl + reql.into(), sysr + reqr.into()];
+        if sysl.dist(sysr) < 2.0 * SUMO_SIZE + COLLISION_BOUNDRY_SIZE {
             let vatt = reqr.vel() - reql.vel();
             let (gyatt, xatt) = <SumoReq as Into<SumoState>>::into(reqr).dir.sin_cos();
             let vec_push = SumoState {
@@ -148,10 +128,10 @@ pub fn create_strat_prober(strat1: Strategy, strat2: Strategy) -> std::thread::J
                 y: gyatt * vatt / PUSH_FRICTION,
                 dir: 0.0,
             };
-            sy_s = (sysl + vec_push, sysr - vec_push);
+            sy_s = [sysl + vec_push, sysr - vec_push];
         };
-        if dbg!(sysl.dist(ORIGIN)) < TATAMI_SIZE {
-            if dbg!(sysr.dist(ORIGIN)) < TATAMI_SIZE {
+        if sysl.dist(ORIGIN) < TATAMI_SIZE {
+            if sysr.dist(ORIGIN) < TATAMI_SIZE {
                 Ok(sy_s)
             } else {
                 Err(Robocillo::Paco)
@@ -163,32 +143,92 @@ pub fn create_strat_prober(strat1: Strategy, strat2: Strategy) -> std::thread::J
 
     fn calc_ir(s1: SumoState, s2: SumoState, dist: f32) -> f32 {
         let glob_dir = s2.origin_dir();
-        if s1.dir < (glob_dir + SUMO_SIZE / 2.0) % 2.0*PI
-            && s1.dir > (glob_dir - SUMO_SIZE / 2.0) % 2.0*PI
+        if s1.dir < (glob_dir + SUMO_SIZE / 2.0) % (2.0 * PI)
+            && s1.dir > (glob_dir - SUMO_SIZE / 2.0) % (2.0 * PI)
         {
-            // ¿?
             dist
         } else {
             0.0
         }
     }
-    spawn(move || loop {
-        let ss_rx = ss_reads.lock().unwrap();
-        sym_state = update(sym_state.unwrap(), *ss_rx);
-        let mut write = sym_lock.write().unwrap();
 
-        match dbg!(sym_state) {
-            Ok((s1, s2)) => {
-                let md = s1.dist(s2);
-                *write = Ok((calc_ir(s1, s2, md), calc_ir(s2, s1, md)))
-            }
-            Err(ganador) => *write = Err(ganador),
+    let mut states = Vec::new();
+    loop {
+        let dist = sym_state[0].dist(sym_state[1]);
+        let ir_reads: [SumoReq; 2] = [
+            as_req(strat1(calc_ir(sym_state[0], sym_state[1], dist))),
+            as_req(strat2(calc_ir(sym_state[1], sym_state[1], dist))),
+        ];
+        match update(sym_state, ir_reads) {
+            Ok(symst) => sym_state = symst,
+            Err(_) => break,
         };
-    })
+        states.push(sym_state);
+    }
+    states
+}
+
+pub fn graphics_driver(states: Vec<[SumoState; 2]>) {
+    let maxx = getmaxx(stdscr());
+    let maxy = getmaxy(stdscr());
+
+    for frame in 0..states.len() {
+        clear();
+        for y in 0..maxy {
+            for x in 0..maxx - 1{
+                let cx = x / 2 - maxx / 4;
+                let cy = y - maxy / 2;
+                let d = f32::sqrt((cx * cx) as f32 + (cy * cy) as f32);
+                if states[frame][0].x.round() == cx as f32
+                    && states[frame][0].y.round() == cy as f32
+                {
+                    attrset(COLOR_PAIR(1));
+                    addch('=' as u32);
+                } else if states[frame][1].x.round() == cx as f32
+                    && states[frame][1].y.round() == cy as f32
+                {
+                    attrset(COLOR_PAIR(2));
+                    addch('=' as u32);
+                } else if is_near(d, TATAMI_SIZE as f32, DRAWING_BOUNDRY_SIZE) {
+                    attrset(COLOR_PAIR(0));
+                    addch('#' as u32);
+                }/*  else if is_near(
+                    cx as f32 * states[frame][0].dir.tan(),
+                    cy as f32,
+                    DRAWING_BOUNDRY_SIZE,
+                ) {
+                    attrset(COLOR_PAIR(1));
+                    addch('.' as u32);
+                } else if is_near(
+                    cx as f32 * states[frame][1].dir.tan(),
+                    cy as f32,
+                    DRAWING_BOUNDRY_SIZE,
+                ) {
+                    attrset(COLOR_PAIR(2));
+                    addch('.' as u32);
+                }  */else {
+                    attroff(0); 
+                    attroff(1); 
+                    attroff(2); 
+                    addch(' ' as u32);
+                }
+            }
+            addch('\n' as u32);
+        }
+        refresh();
+        sleep(Duration::from_millis(250));
+    }
 }
 
 fn main() {
-    create_strat_prober(|_| (0.5, 0.5), |_| (0.5, 0.5))
-        .join()
-        .unwrap(); // Rotate the
+    initscr();
+    start_color();
+    init_pair(0, COLOR_GREEN, COLOR_BLACK);
+    init_pair(1, COLOR_BLUE, COLOR_BLACK);
+    init_pair(2, COLOR_RED, COLOR_BLACK);
+
+    let res = probe_strategy(|_| (-0.5, -0.5), |_| (0.0, 0.0));
+    graphics_driver(res);
+    getch();
+    endwin();
 }
