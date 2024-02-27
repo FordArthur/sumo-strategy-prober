@@ -68,7 +68,7 @@ impl Add<SumoState> for SumoState {
         SumoState {
             x: self.x + sstate.x,
             y: self.y + sstate.y,
-            dir: (self.dir + sstate.dir) % 360.0,
+            dir: (self.dir + sstate.dir) % 2.0*PI,
         }
     }
 }
@@ -148,7 +148,7 @@ pub fn create_strat_prober(strat1: Strategy, strat2: Strategy) -> std::thread::J
                 y: gyatt * vatt / PUSH_FRICTION,
                 dir: 0.0,
             };
-            sy_s = (sysl - vec_push, sysr - vec_push);
+            sy_s = (sysl + vec_push, sysr - vec_push);
         };
         if dbg!(sysl.dist(ORIGIN)) < TATAMI_SIZE {
             if dbg!(sysr.dist(ORIGIN)) < TATAMI_SIZE {
@@ -163,8 +163,8 @@ pub fn create_strat_prober(strat1: Strategy, strat2: Strategy) -> std::thread::J
 
     fn calc_ir(s1: SumoState, s2: SumoState, dist: f32) -> f32 {
         let glob_dir = s2.origin_dir();
-        if s1.dir < (glob_dir + SUMO_SIZE / 2.0) % 360.0
-            && s1.dir > (glob_dir - SUMO_SIZE / 2.0) % 360.0
+        if s1.dir < (glob_dir + SUMO_SIZE / 2.0) % 2.0*PI
+            && s1.dir > (glob_dir - SUMO_SIZE / 2.0) % 2.0*PI
         {
             // ¿?
             dist
